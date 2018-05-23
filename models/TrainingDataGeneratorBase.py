@@ -5,13 +5,13 @@ from utils import iter_utils
 import numpy as np
 import cv2
 import random
+import traceback
 
 '''
 You can implement your own TrainingDataGenerator
 '''
-
 class TrainingDataGeneratorBase(object):
-    
+   
     #DONT OVERRIDE
     #use YourOwnTrainingDataGenerator (..., your_opt=1)
     #and then this opt will be passed in YourOwnTrainingDataGenerator.onInitialize ( your_opt )
@@ -25,9 +25,12 @@ class TrainingDataGeneratorBase(object):
         self.data = modelbase.get_training_data(trainingdatatype)
         
         if self.debug:
-            self.generator = iter_utils.ThisThreadGenerator ( self.batch_func )
+            self.generators = [iter_utils.ThisThreadGenerator ( self.batch_func, self.data)]
         else:
-            self.generator = iter_utils.SubprocessGenerator ( self.batch_func )
+            self.generators = [iter_utils.SubprocessGenerator ( self.batch_func, self.data[0::2] ),
+                               iter_utils.SubprocessGenerator ( self.batch_func, self.data[1::2] )]
+                               
+        self.generator_counter = -1
             
         self.onInitialize(**kwargs)
         
@@ -45,30 +48,43 @@ class TrainingDataGeneratorBase(object):
         return self
         
     def __next__(self):
-        x = next(self.generator) 
+        self.generator_counter += 1
+        generator = self.generators[self.generator_counter % len(self.generators) ]    
+        x = next(generator) 
         return x
         
-    def batch_func(self):
-        data_len = len(self.data)
+    def batch_func(self, data):
+        data_len = len(data)
         if data_len == 0:
             raise ValueError('No training data provided.')
             
-        if self.trainingdatatype >= TrainingDataType.SRC_YAW_SORTED and self.trainingdatatype <= TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST:
+        if (self.trainingdatatype == TrainingDataType.FACE_SRC or self.trainingdatatype == TrainingDataType.FACE_SRC_WITH_NEAREST) and data_len > 1500:
+            print ("Warning, your src faceset contains more than 1500 faces. This can make worse result. Reduce it by sort --by hist-dissim.")
+        
+        if self.trainingdatatype >= TrainingDataType.FACE_SRC_YAW_SORTED and self.trainingdatatype <= TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST_WITH_NEAREST:
             if all ( [ x == None for x in self.data] ):
-             raise ValueError('Not enough training data. Gather more faces!')
-
-        if self.trainingdatatype >= TrainingDataType.SRC_YAW_SORTED and self.trainingdatatype <= TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST:
+                raise ValueError('Not enough training data. Gather more faces!')
+             
+        if self.trainingdatatype >= TrainingDataType.IMAGE_SRC and self.trainingdatatype <= TrainingDataType.FACE_DST_ONLY_1:
+            shuffle_idxs = []          
+        elif self.trainingdatatype >= TrainingDataType.FACE_SRC_YAW_SORTED and self.trainingdatatype <= TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST_WITH_NEAREST:
             shuffle_idxs = []            
             shuffle_idxs_2D = [[]]*data_len
-
+            
         while True:                
+            
             batches = None
             for n_batch in range(0, self.batch_size):
                 while True:
                     sample = None
-                    
-                    if self.trainingdatatype >= TrainingDataType.SRC_YAW_SORTED and self.trainingdatatype <= TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST:
-                    
+                                
+                    if self.trainingdatatype >= TrainingDataType.IMAGE_SRC and self.trainingdatatype <= TrainingDataType.FACE_DST_ONLY_1:
+                        if len(shuffle_idxs) == 0:
+                            shuffle_idxs = [ i for i in range(0, data_len) ]
+                            random.shuffle(shuffle_idxs)                            
+                        idx = shuffle_idxs.pop()
+                        sample = self.data[ idx ]
+                    elif self.trainingdatatype >= TrainingDataType.FACE_SRC_YAW_SORTED and self.trainingdatatype <= TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST_WITH_NEAREST:
                         if len(shuffle_idxs) == 0:
                             shuffle_idxs = [ i for i in range(0, data_len) ]
                             random.shuffle(shuffle_idxs)
@@ -81,22 +97,25 @@ class TrainingDataGeneratorBase(object):
                                 
                             idx2 = shuffle_idxs_2D[idx].pop()                            
                             sample = self.data[idx][idx2]
-                                
-                    elif self.trainingdatatype == TrainingDataType.SRC or self.trainingdatatype <= TrainingDataType.DST:
-                        sample = self.data[ np.random.randint(0,data_len) ]
-
-                    
-                    if sample is not None:                        
-                        x = self.onProcessSample (sample, self.debug)
+                            
+                    if sample is not None:          
+                        try:
+                            x = self.onProcessSample (sample, self.debug)
+                        except:
+                            raise Exception ("Exception occured in sample %s. Error: %s" % (sample.filename, traceback.format_exc() ) )
                         
                         if type(x) != tuple and type(x) != list:
                             raise Exception('TrainingDataGenerator.onProcessSample() returns NOT tuple/list')
+                            
                         x_len = len(x)
                         if batches is None:
                             batches = [ [] for _ in range(0,x_len) ]
+                            
                         for i in range(0,x_len):
                             batches[i].append ( x[i] )
+                            
                         break
+                        
             yield [ np.array(batch) for batch in batches]
         
     def get_dict_state(self):
@@ -105,3 +124,4 @@ class TrainingDataGeneratorBase(object):
     def set_dict_state(self, state):
         pass
 
+    

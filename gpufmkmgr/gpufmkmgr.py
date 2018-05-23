@@ -18,9 +18,9 @@ def import_dlib(device_idx):
 
 tf_module = None
 tf_session = None
-
 keras_module = None
 keras_contrib_module = None
+keras_vggface_module = None
 
 def get_tf_session():
     global tf_session
@@ -37,12 +37,17 @@ def import_tf( device_idxs_list, allow_growth ):
 
     if 'TF_SUPPRESS_STD' in os.environ.keys() and os.environ['TF_SUPPRESS_STD'] == '1':
         suppressor = std_utils.suppress_stdout_stderr().__enter__()
+    else:
+        suppressor = None
 
+    if 'CUDA_VISIBLE_DEVICES' in os.environ.keys():
+        os.environ.pop('CUDA_VISIBLE_DEVICES')
+    
+    os.environ['TF_MIN_GPU_MULTIPROCESSOR_COUNT'] = '2'
+    
     import tensorflow as tf
     tf_module = tf
-
-    os.environ['TF_MIN_GPU_MULTIPROCESSOR_COUNT'] = '2'
-
+    
     visible_device_list = ''
     for idx in device_idxs_list: visible_device_list += str(idx) + ','
     visible_device_list = visible_device_list[:-1]
@@ -50,11 +55,12 @@ def import_tf( device_idxs_list, allow_growth ):
     config = tf_module.ConfigProto()
     config.gpu_options.allow_growth = allow_growth
     config.gpu_options.visible_device_list=visible_device_list
+    config.gpu_options.force_gpu_compatible = True
     tf_session = tf_module.Session(config=config)
-    
-    if 'TF_SUPPRESS_STD' in os.environ.keys() and os.environ['TF_SUPPRESS_STD'] == '1':        
+        
+    if suppressor is not None:  
         suppressor.__exit__()
-      
+
     return tf_module
 
 def finalize_tf():
@@ -67,20 +73,18 @@ def finalize_tf():
 
 def import_keras():
     global keras_module
-    global keras_contrib_module
     
     if keras_module is not None:
         raise Exception ('Multiple import of keras is not allowed, reorganize your program.')
         
     sess = get_tf_session()
     if sess is None:
-        raise Exception ('No TF session found. Import tf first.')
+        raise Exception ('No TF session found. Import TF first.')
         
     if 'TF_SUPPRESS_STD' in os.environ.keys() and os.environ['TF_SUPPRESS_STD'] == '1':
         suppressor = std_utils.suppress_stdout_stderr().__enter__()
         
-    import keras
-    import keras_contrib        
+    import keras     
 
     keras.backend.tensorflow_backend.set_session(sess)
     
@@ -88,27 +92,48 @@ def import_keras():
         suppressor.__exit__()
 
     keras_module = keras
-    keras_contrib_module = keras_contrib
     return keras_module
     
 def finalize_keras():
     global keras_module
+    keras_module.backend.clear_session()
     keras_module = None
-    global keras_contrib_module
-    keras_contrib_module = None
     
 def import_keras_contrib():
     global keras_contrib_module
-    if keras_contrib_module is None:
-        raise Exception('import keras first')
+    
+    if keras_contrib_module is not None:
+        raise Exception ('Multiple import of keras_contrib is not allowed, reorganize your program.')
+    import keras_contrib
+    keras_contrib_module = keras_contrib
     return keras_contrib_module
-
+    
 def finalize_keras_contrib():
     global keras_contrib_module
     keras_contrib_module = None
     
+def import_keras_vggface(optional=False):
+    global keras_vggface_module
+    
+    if keras_vggface_module is not None:
+        raise Exception ('Multiple import of keras_vggface_module is not allowed, reorganize your program.')
 
-
+    try:
+        import keras_vggface
+    except:
+        if optional:
+            print ("Unable to import keras_vggface. It will not be used.")
+        else:
+            raise Exception ("Unable to import keras_vggface.")
+        keras_vggface = None
+        
+    keras_vggface_module = keras_vggface
+    return keras_vggface_module
+    
+def finalize_keras_vggface():
+    global keras_vggface_module
+    keras_vggface_module = None    
+    
 #returns [ (device_idx, device_name), ... ]
 def getDevicesWithAtLeastFreeMemory(freememsize):
     result = []
@@ -171,6 +196,20 @@ def getBestDeviceIdx():
         handle = nvmlDeviceGetHandleByIndex(i)
         memInfo = nvmlDeviceGetMemoryInfo( handle )
         if memInfo.total > idx_mem:
+            idx = i
+            idx_mem = memInfo.total
+
+    nvmlShutdown()
+    return idx
+    
+def getWorstDeviceIdx():
+    nvmlInit()    
+    idx = -1
+    idx_mem = sys.maxsize
+    for i in range(0, nvmlDeviceGetCount() ):
+        handle = nvmlDeviceGetHandleByIndex(i)
+        memInfo = nvmlDeviceGetMemoryInfo( handle )
+        if memInfo.total < idx_mem:
             idx = i
             idx_mem = memInfo.total
 

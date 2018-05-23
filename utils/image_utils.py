@@ -1,11 +1,12 @@
 import sys
+from utils import random_utils
 import numpy as np
 import cv2
 import localization
 from scipy.spatial import Delaunay
 from PIL import Image, ImageDraw, ImageFont
 
-def hist_match(source, template, mask=None):
+def channel_hist_match(source, template, mask=None):
     # Code borrowed from:
     # https://stackoverflow.com/questions/32655686/histogram-matching-of-two-images-in-python-2-x
     masked_source = source
@@ -37,16 +38,16 @@ def hist_match(source, template, mask=None):
 
 def color_hist_match(src_im, tar_im, mask=None):
     h,w,c = src_im.shape
-    matched_R = hist_match(src_im[:,:,0], tar_im[:,:,0], mask)
-    matched_G = hist_match(src_im[:,:,1], tar_im[:,:,1], mask)
-    matched_B = hist_match(src_im[:,:,2], tar_im[:,:,2], mask)
+    matched_R = channel_hist_match(src_im[:,:,0], tar_im[:,:,0], mask)
+    matched_G = channel_hist_match(src_im[:,:,1], tar_im[:,:,1], mask)
+    matched_B = channel_hist_match(src_im[:,:,2], tar_im[:,:,2], mask)
     
     to_stack = (matched_R, matched_G, matched_B)
     for i in range(3, c):
         to_stack += ( src_im[:,:,i],)
     
     
-    matched = np.stack(to_stack, axis=2).astype(src_im.dtype)
+    matched = np.stack(to_stack, axis=-1).astype(src_im.dtype)
     return matched
     
 
@@ -150,11 +151,25 @@ def morph_by_points (image, sp, dp):
 
     for tri in Delaunay(dp).simplices:                                    
         morphTriangle(result_image, image, sp[tri], dp[tri])
-        
+       
     return result_image
     
-def equalize_and_stack (wh, images, axis=1):
+def equalize_and_stack_square (images, axis=1):
     max_c = max ([ 1 if len(image.shape) == 2 else image.shape[2]  for image in images ] )
+    
+    target_wh = 99999
+    for i,image in enumerate(images):
+        if len(image.shape) == 2:
+            h,w = image.shape
+            c = 1
+        else:
+            h,w,c = image.shape
+        
+        if h < target_wh:
+            target_wh = h
+    
+        if w < target_wh:
+            target_wh = w
             
     for i,image in enumerate(images):
         if len(image.shape) == 2:
@@ -166,13 +181,16 @@ def equalize_and_stack (wh, images, axis=1):
         if c < max_c:
             if c == 1:
                 if len(image.shape) == 2:
-                    image = np.expand_dims ( image, 2 )                
-                image = np.concatenate ( (image,)*max_c, axis=2 )
+                    image = np.expand_dims ( image, -1 )                
+                image = np.concatenate ( (image,)*max_c, -1 )
+            elif c == 2: #GA
+                image = np.expand_dims ( image[...,0], -1 )
+                image = np.concatenate ( (image,)*max_c, -1 )                
             else:
-                image = np.concatenate ( (image, np.ones((h,w,max_c - c))), axis=2 )
+                image = np.concatenate ( (image, np.ones((h,w,max_c - c))), -1 )
 
-        if h != wh or w != wh:
-            image = cv2.resize ( image, (wh, wh) )
+        if h != target_wh or w != target_wh:
+            image = cv2.resize ( image, (target_wh, target_wh) )
             h,w,c = image.shape
                 
         images[i] = image
@@ -196,3 +214,51 @@ def hsva2bgra (img):
 
 def hsva2bgra_list (imgs):
     return [ hsva2bgra(img) for img in imgs ]
+    
+def gen_warp_params (source, flip):
+    h,w,c = source.shape
+    if (h != w) or (w != 64 and w != 128 and w != 256 and w != 512 and w != 1024):
+        raise ValueError ('TrainingDataGenerator accepts only square power of 2 images.')
+        
+    rotation = np.random.uniform(-10, 10)
+    scale = np.random.uniform(1 - 0.05, 1 + 0.05)
+    tx = np.random.uniform(-0.05, 0.05)
+    ty = np.random.uniform(-0.05, 0.05)    
+ 
+    #random warp by grid
+    cell_size = [ w // (2**i) for i in range(1,4) ] [ np.random.randint(3) ]
+    cell_count = w // cell_size + 1
+    
+    grid_points = np.linspace( 0, w, cell_count)
+    mapx = np.broadcast_to(grid_points, (cell_count, cell_count)).copy()
+    mapy = mapx.T
+    
+    mapx[1:-1,1:-1] = mapx[1:-1,1:-1] + random_utils.random_normal( size=(cell_count-2, cell_count-2) )*(cell_size*0.24)
+    mapy[1:-1,1:-1] = mapy[1:-1,1:-1] + random_utils.random_normal( size=(cell_count-2, cell_count-2) )*(cell_size*0.24)
+
+    half_cell_size = cell_size // 2
+    
+    mapx = cv2.resize(mapx, (w+cell_size,)*2 )[half_cell_size:-half_cell_size-1,half_cell_size:-half_cell_size-1].astype(np.float32)
+    mapy = cv2.resize(mapy, (w+cell_size,)*2 )[half_cell_size:-half_cell_size-1,half_cell_size:-half_cell_size-1].astype(np.float32)
+    
+    #random transform
+    random_transform_mat = cv2.getRotationMatrix2D((w // 2, w // 2), rotation, scale)
+    random_transform_mat[:, 2] += (tx*w, ty*w)
+    
+    params = dict()
+    params['mapx'] = mapx
+    params['mapy'] = mapy
+    params['rmat'] = random_transform_mat
+    params['w'] = w        
+    params['flip'] = flip and np.random.randint(10) < 4
+            
+    return params
+    
+def warp_by_params (params, img, warp, transform, flip):
+    if warp:
+        img = cv2.remap(img, params['mapx'], params['mapy'], cv2.INTER_LANCZOS4 )
+    if transform:
+        img = cv2.warpAffine( img, params['rmat'], (params['w'], params['w']), borderMode=cv2.BORDER_CONSTANT, flags=cv2.INTER_LANCZOS4 )            
+    if flip and params['flip']:
+        img = img[:,::-1,:]
+    return img

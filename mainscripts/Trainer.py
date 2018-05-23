@@ -190,6 +190,8 @@ def previewThread (input_queue, output_queue):
    
             if loss_history is not None:
                 # LOSS HISTORY
+                loss_history = np.array (loss_history)
+                
                 lh_height = 100
                 lh_img = np.ones ( (lh_height,w,c) ) * 0.1
                 loss_count = len(loss_history[0])
@@ -215,8 +217,8 @@ def previewThread (input_queue, output_queue):
                                     for p in range(0,loss_count) 
                                 ]  
                                 for col in range(0, w) 
-                            ] 
-                plist_abs_max = 0.03
+                            ]
+                plist_abs_max = np.mean(loss_history[ len(loss_history) // 5 : ]) * 2
                 
                 if l_per_col >= 1.0:
                     for col in range(0, w):
@@ -279,7 +281,7 @@ def main (training_data_src_dir, training_data_dst_dir, model_path, model_name, 
     print ("Running trainer.\r\n")
     
     output_queue = queue.Queue()
-    input_queue = queue.Queue()    
+    input_queue = queue.Queue()
     import threading
     thread = threading.Thread(target=trainerThread, args=(output_queue, input_queue, training_data_src_dir, training_data_dst_dir, model_path, model_name), kwargs=in_options )
     thread.start()

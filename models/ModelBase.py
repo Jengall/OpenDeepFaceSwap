@@ -1,3 +1,5 @@
+import inspect
+import os
 import operator
 from pathlib import Path
 import pickle
@@ -9,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import gpufmkmgr
 import time
+from facelib import FaceType
 from facelib import LandmarksProcessor
 from .TrainingDataGeneratorBase import TrainingDataGeneratorBase
 
@@ -27,14 +30,15 @@ class ModelBase(object):
     #DONT OVERRIDE
     def __init__(self, model_path, training_data_src_path=None, training_data_dst_path=None,
                         multi_gpu = False,
+                        choose_worst_gpu = False,
                         force_best_gpu_idx = -1,
+                        force_gpu_idxs = None,
                         write_preview_history = False,
                         debug = False, **in_options
                 ):
         print ("Loading model...")
         self.model_path = model_path
         self.model_data_path = Path( self.get_strpath_storage_for_file('data.dat') )
-        
         
         self.training_data_src_path = training_data_src_path
         self.training_data_dst_path = training_data_dst_path
@@ -50,7 +54,7 @@ class ModelBase(object):
         self.batch_size = 1
         self.write_preview_history = write_preview_history
         self.debug = debug
-        self.supress_std_once = False#True
+        self.supress_std_once = ('TF_SUPPRESS_STD' in os.environ.keys() and os.environ['TF_SUPPRESS_STD'] == '1')
         
         if self.model_data_path.exists():            
             model_data = pickle.loads ( self.model_data_path.read_bytes() )            
@@ -75,17 +79,15 @@ class ModelBase(object):
                 if self.epoch == 0:
                     for filename in Path_utils.get_image_paths(self.preview_history_path):
                         Path(filename).unlink()    
-            
-        
+
         self.multi_gpu = multi_gpu
    
-        gpu_idx = force_best_gpu_idx if (force_best_gpu_idx >= 0 and gpufmkmgr.isValidDeviceIdx(force_best_gpu_idx)) else gpufmkmgr.getBestDeviceIdx()
+        gpu_idx = force_best_gpu_idx if (force_best_gpu_idx >= 0 and gpufmkmgr.isValidDeviceIdx(force_best_gpu_idx)) else gpufmkmgr.getBestDeviceIdx() if not choose_worst_gpu else gpufmkmgr.getWorstDeviceIdx()
         gpu_total_vram_gb = gpufmkmgr.getDeviceVRAMTotalGb (gpu_idx)
         is_gpu_low_mem = (gpu_total_vram_gb < 4)
         
         self.gpu_total_vram_gb = gpu_total_vram_gb
-        
-        
+
         if self.epoch == 0: 
             #first run         
             self.options['created_vram_gb'] = gpu_total_vram_gb
@@ -93,25 +95,25 @@ class ModelBase(object):
         else: 
             #not first run        
             if 'created_vram_gb' in self.options.keys():
-                if self.options['created_vram_gb'] > gpu_total_vram_gb:
-                    raise Exception('Unable to run this model on GPU, because it was created on GPU with higher amount of VRAM.')
-                
                 self.created_vram_gb = self.options['created_vram_gb']
             else:
                 self.options['created_vram_gb'] = gpu_total_vram_gb
                 self.created_vram_gb = gpu_total_vram_gb
             
-        if self.multi_gpu:
-            self.gpu_idxs = gpufmkmgr.getDeviceIdxsEqualModel( gpu_idx )
-            if len(self.gpu_idxs) <= 1:
-                self.multi_gpu = False
+        if force_gpu_idxs is not None:
+            self.gpu_idxs = [ int(x) for x in force_gpu_idxs.split(',') ]
         else:
-            self.gpu_idxs = [gpu_idx]
-
-        self.tf = gpufmkmgr.import_tf(self.gpu_idxs,allow_growth=False)
-        self.keras = gpufmkmgr.import_keras()   
-        self.keras_contrib = gpufmkmgr.import_keras_contrib()        
+            if self.multi_gpu:
+                self.gpu_idxs = gpufmkmgr.getDeviceIdxsEqualModel( gpu_idx )
+                if len(self.gpu_idxs) <= 1:
+                    self.multi_gpu = False
+            else:
+                self.gpu_idxs = [gpu_idx]
         
+        self.tf = gpufmkmgr.import_tf(self.gpu_idxs,allow_growth=False)
+        self.keras = gpufmkmgr.import_keras()
+        self.keras_contrib = gpufmkmgr.import_keras_contrib()
+ 
         self.onInitialize(**in_options)
         
         if self.debug:
@@ -130,8 +132,7 @@ class ModelBase(object):
                         
             if self.sample_for_preview is None:
                 self.sample_for_preview = self.generate_next_sample()
-                
-        
+
         print ("===== Model summary =====")
         print ("== Model name: " + self.get_model_name())
         print ("==")
@@ -149,10 +150,11 @@ class ModelBase(object):
  
         if self.gpu_total_vram_gb == 2:
             print ("==")
-            print ("== WARNING: You are using 2GB GPU. If training does not start,")
-            print ("== close all programs and try again.")
+            print ("== WARNING: You are using 2GB GPU. Result quality may be significantly decreased.")
+            print ("== If training does not start, close all programs and try again.")
             print ("== Also you can disable Windows Aero Desktop to get extra free VRAM.")
             print ("==")
+            
         print ("=========================")
   
     #overridable
@@ -184,10 +186,9 @@ class ModelBase(object):
         #return [ ('preview_name',preview_rgb), ... ]        
         return []
 
-    #overridable   
+    #overridable if you want model name differs from folder name
     def get_model_name(self):
-        #also used as prefix for model files
-        return "ModelBase"
+        return Path(inspect.getmodule(self).__file__).parent.name.rsplit("_", 1)[1]
         
     #overridable
     def get_converter(self, **in_options):
@@ -218,10 +219,11 @@ class ModelBase(object):
         
     def get_static_preview(self):        
         return self.onGetPreview (self.sample_for_preview)[0][1] #first preview, and bgr
-        
-        
+       
     def save(self):    
         print ("Saving...")
+        
+        self.onSave()
         
         model_data = {
             'epoch': self.epoch,
@@ -231,22 +233,26 @@ class ModelBase(object):
             'sample_for_preview' : self.sample_for_preview
         }            
         self.model_data_path.write_bytes( pickle.dumps(model_data) )
-        
-        self.onSave()
+
+    def save_weights_safe(self, model_filename_list):
+        for model, filename in model_filename_list:
+            model.save_weights( filename + '.tmp' )
+            
+        for model, filename in model_filename_list:
+            source_filename = Path(filename+'.tmp')
+            target_filename = Path(filename)
+            if target_filename.exists():
+                target_filename.unlink()
+                
+            source_filename.rename ( str(target_filename) )
         
     def debug_one_epoch(self):
-        wh = 64
         images = []
         for generator in self.generator_list:        
             for i,batch in enumerate(next(generator)):
-                if i == 0:                    
-                    wh = max(wh, int(batch[0]))
-                    if wh < 64 or wh > 256:
-                        raise Exception('in debug mode onProcessSample() check size of samples')
-                    continue
                 images.append( batch[0] )
         
-        return image_utils.equalize_and_stack (wh, images)
+        return image_utils.equalize_and_stack_square (images)
         
     def generate_next_sample(self):
         return [next(generator) for generator in self.generator_list]
@@ -315,50 +321,64 @@ class ModelBase(object):
         if not isinstance(dtype, TrainingDataType):
             raise Exception('get_training_data dtype is not TrainingDataType')
     
-        if dtype == TrainingDataType.SRC:
-            if self.training_datas[TrainingDataType.SRC] is None:  
-                self.training_datas[TrainingDataType.SRC] = X_LOAD( [ TrainingDataSample(filename=filename) for filename in Path_utils.get_image_paths(self.training_data_src_path) ] )
-            return self.training_datas[TrainingDataType.SRC]
-
-        elif dtype == TrainingDataType.DST:
-            if self.training_datas[TrainingDataType.DST] is None:
-                self.training_datas[TrainingDataType.DST] = X_LOAD( [ TrainingDataSample(filename=filename) for filename in Path_utils.get_image_paths(self.training_data_dst_path) ] )
-            return self.training_datas[TrainingDataType.DST]
-            
-        elif dtype == TrainingDataType.SRC_YAW_SORTED:
-            if self.training_datas[TrainingDataType.SRC_YAW_SORTED] is None:
-                self.training_datas[TrainingDataType.SRC_YAW_SORTED] = X_YAW_SORTED( self.get_training_data(TrainingDataType.SRC) )
-            return self.training_datas[TrainingDataType.SRC_YAW_SORTED]
-
-        elif dtype == TrainingDataType.DST_YAW_SORTED:
-            if self.training_datas[TrainingDataType.DST_YAW_SORTED] is None:
-                self.training_datas[TrainingDataType.DST_YAW_SORTED] = X_YAW_SORTED( self.get_training_data(TrainingDataType.DST))
-            return self.training_datas[TrainingDataType.DST_YAW_SORTED]
-    
-        elif dtype == TrainingDataType.SRC_YAW_SORTED_AS_DST:            
-            if self.training_datas[TrainingDataType.SRC_YAW_SORTED_AS_DST] is None:
-                self.training_datas[TrainingDataType.SRC_YAW_SORTED_AS_DST] = X_YAW_AS_Y_SORTED( self.get_training_data(TrainingDataType.SRC_YAW_SORTED), self.get_training_data(TrainingDataType.DST_YAW_SORTED) )
-            return self.training_datas[TrainingDataType.SRC_YAW_SORTED_AS_DST]
         
-        elif dtype == TrainingDataType.DST_YAW_SORTED_AS_SRC:            
-            if self.training_datas[TrainingDataType.DST_YAW_SORTED_AS_SRC] is None:
-                self.training_datas[TrainingDataType.DST_YAW_SORTED_AS_SRC] = X_YAW_AS_Y_SORTED( self.get_training_data(TrainingDataType.DST_YAW_SORTED), self.get_training_data(TrainingDataType.SRC_YAW_SORTED) )
-            return self.training_datas[TrainingDataType.DST_YAW_SORTED_AS_SRC]
+        if dtype == TrainingDataType.IMAGE_SRC:
+            if self.training_datas[dtype] is None:  
+                self.training_datas[dtype] = [ TrainingDataSample(filename=filename) for filename in tqdm( Path_utils.get_image_paths(self.training_data_src_path), desc="Loading" ) ]
+            return self.training_datas[dtype]
             
-        elif dtype == TrainingDataType.SRC_YAW_SORTED_AS_DST_WITH_NEAREST:
-            if self.training_datas[TrainingDataType.SRC_YAW_SORTED_AS_DST_WITH_NEAREST] is None:     
-                self.training_datas[TrainingDataType.SRC_YAW_SORTED_AS_DST_WITH_NEAREST] = calc_X_YAW_AS_Y_SORTED_WITH_NEAREST_Y ( self.get_training_data(TrainingDataType.SRC_YAW_SORTED_AS_DST), self.get_training_data(TrainingDataType.DST) )             
-                return self.training_datas[TrainingDataType.SRC_YAW_SORTED_AS_DST_WITH_NEAREST]
-    
-        elif dtype == TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST:
-            if self.training_datas[TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST] is None:     
-                self.training_datas[TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST] = calc_X_YAW_AS_Y_SORTED_WITH_NEAREST_Y ( self.get_training_data(TrainingDataType.DST_YAW_SORTED_AS_SRC), self.get_training_data(TrainingDataType.SRC) )             
-                return self.training_datas[TrainingDataType.DST_YAW_SORTED_AS_SRC_WITH_NEAREST]
+        elif dtype == TrainingDataType.IMAGE_DST:
+            if self.training_datas[dtype] is None:  
+                self.training_datas[dtype] = [ TrainingDataSample(filename=filename) for filename in tqdm( Path_utils.get_image_paths(self.training_data_dst_path), desc="Loading" ) ]
+            return self.training_datas[dtype]
+            
+        elif dtype == TrainingDataType.FACE_SRC:
+            if self.training_datas[dtype] is None:  
+                self.training_datas[dtype] = X_LOAD( [ TrainingDataSample(filename=filename) for filename in Path_utils.get_image_paths(self.training_data_src_path) ] )
+            return self.training_datas[dtype]
+            
+        elif dtype == TrainingDataType.FACE_DST:
+            if self.training_datas[dtype] is None:
+                self.training_datas[dtype] = X_LOAD( [ TrainingDataSample(filename=filename) for filename in Path_utils.get_image_paths(self.training_data_dst_path) ] )
+            return self.training_datas[dtype]
+            
+        elif dtype == TrainingDataType.FACE_SRC_WITH_NEAREST:
+            if self.training_datas[dtype] is None:  
+                self.training_datas[dtype] = X_WITH_NEAREST_Y( self.get_training_data(TrainingDataType.FACE_SRC), self.get_training_data(TrainingDataType.FACE_DST) )
+            return self.training_datas[dtype]
+            
+        elif dtype == TrainingDataType.FACE_SRC_ONLY_10_NEAREST_TO_DST_ONLY_1:
+            if self.training_datas[dtype] is None:  
+                self.training_datas[dtype] = X_ONLY_n_NEAREST_TO_Y_ONLY_1( self.get_training_data(TrainingDataType.FACE_SRC), 10, self.get_training_data(TrainingDataType.FACE_DST_ONLY_1) )
+            return self.training_datas[dtype]
+        
+        elif dtype == TrainingDataType.FACE_DST_ONLY_1:
+            if self.training_datas[dtype] is None:  
+                self.training_datas[dtype] = X_ONLY_1( self.get_training_data(TrainingDataType.FACE_DST)  )
+            return self.training_datas[dtype]
+          
+        elif dtype == TrainingDataType.FACE_SRC_YAW_SORTED:
+            if self.training_datas[dtype] is None:
+                self.training_datas[dtype] = X_YAW_SORTED( self.get_training_data(TrainingDataType.FACE_SRC) )
+            return self.training_datas[dtype]
+
+        elif dtype == TrainingDataType.FACE_DST_YAW_SORTED:
+            if self.training_datas[dtype] is None:
+                self.training_datas[dtype] = X_YAW_SORTED( self.get_training_data(TrainingDataType.FACE_DST))
+            return self.training_datas[dtype]
+          
+        elif dtype == TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST:            
+            if self.training_datas[dtype] is None:
+                self.training_datas[dtype] = X_YAW_AS_Y_SORTED( self.get_training_data(TrainingDataType.FACE_SRC_YAW_SORTED), self.get_training_data(TrainingDataType.FACE_DST_YAW_SORTED) )
+            return self.training_datas[dtype]
+         
+        elif dtype == TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST_WITH_NEAREST:
+            if self.training_datas[dtype] is None:     
+                self.training_datas[dtype] = calc_X_YAW_AS_Y_SORTED_WITH_NEAREST_Y ( self.get_training_data(TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST), self.get_training_data(TrainingDataType.FACE_DST) )             
+                return self.training_datas[dtype]
                 
         return None
-
-
-
+    
 def X_LOAD ( RAWS ):
     sample_list = []
     
@@ -378,15 +398,40 @@ def X_LOAD ( RAWS ):
         if d is None or d['landmarks'] is None or d['yaw_value'] is None:
             print ("%s - no embedded faceswap info found required for training" % (s_filename_path.name) ) 
             continue
- 
-        sample_list.append( s.copy_and_set(shape=a_png.get_shape(), landmarks=d['landmarks'], yaw=d['yaw_value']) )
+            
+        face_type = d['face_type'] if 'face_type' in d.keys() else 'full_face'        
+        face_type = FaceType.fromString (face_type) 
+        sample_list.append( s.copy_and_set(face_type=face_type, shape=a_png.get_shape(), landmarks=d['landmarks'], yaw=d['yaw_value']) )
         
     return sample_list
     
+def X_WITH_NEAREST_Y (X,Y ):
+    new_sample_list = []
+    for sample in tqdm(X, desc="Sorting"):
+        nearest = [ (i, np.square( d.landmarks-sample.landmarks ).sum() ) for i,d in enumerate(Y) ]                
+        nearest = sorted(nearest, key=operator.itemgetter(-1), reverse=False)
+        
+        nearest = [ Y[x[0]] for x in nearest[0:10] ]          
+        new_sample_list.append ( sample.copy_and_set( nearest_target_list=nearest ) )
+    return new_sample_list
+
+def X_ONLY_1(X):
+    if len(X) == 0:
+        raise Exception('Not enough training data.')
+     
+    return [ X[0] ]
+
+def X_ONLY_n_NEAREST_TO_Y_ONLY_1(X,n,Y):
+    target = Y[0]    
+    nearest = [ (i, np.square( d.landmarks[17:]-target.landmarks[17:] ).sum() ) for i,d in enumerate(X) ]
+    nearest = sorted(nearest, key=operator.itemgetter(-1), reverse=False)
+    nearest = [ X[s[0]].copy_and_set (nearest_target_list=[target]) for s in nearest[0:n] ]      
+    return nearest
+    
 def X_YAW_SORTED( YAW_RAWS ):
 
-    lowest_yaw, highest_yaw = -128, +128       
-    gradations = 256
+    lowest_yaw, highest_yaw = -32, +32      
+    gradations = 64
     diff_rot_per_grad = abs(highest_yaw-lowest_yaw) / gradations
 
     yaws_sample_list = [None]*gradations
@@ -407,7 +452,7 @@ def X_YAW_SORTED( YAW_RAWS ):
             yaws_sample_list[i] = yaw_samples
     
     return yaws_sample_list
-
+    
 def X_YAW_AS_Y_SORTED (s, t):
     l = len(s)
     if l != len(t):

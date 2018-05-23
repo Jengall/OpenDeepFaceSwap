@@ -11,8 +11,9 @@ from facelib import FaceType
 class Model(ModelBase):
 
     encoderH5 = 'encoder.h5'
-    decoder_srcH5 = 'decoder_src.h5'
-    decoder_dstH5 = 'decoder_dst.h5'
+    decoderH5 = 'decoder.h5'
+    inter_BH5 = 'inter_B.h5'
+    inter_ABH5 = 'inter_AB.h5'
 
     #override
     def onInitialize(self, batch_size=-1, **in_options):
@@ -20,31 +21,36 @@ class Model(ModelBase):
             raise Exception ('Sorry, this model works only on 4GB+ GPU')
             
         self.batch_size = batch_size
-        if self.batch_size == 0:     
+        if self.batch_size == 0:          
             if self.gpu_total_vram_gb == 4:
+                self.batch_size = 2
+            elif self.gpu_total_vram_gb == 5:
+                self.batch_size = 4
+            elif self.gpu_total_vram_gb == 6:
                 self.batch_size = 8
-            elif self.gpu_total_vram_gb <= 6:
+            else: 
                 self.batch_size = 16
-            elif self.gpu_total_vram_gb < 12: 
-                self.batch_size = 32
-            else:    
-                self.batch_size = 48 #best for all models
-                
+
         ae_input_layer = self.keras.layers.Input(shape=(128, 128, 3))
         mask_layer = self.keras.layers.Input(shape=(128, 128, 1)) #same as output
-        
+
         self.encoder = self.Encoder(ae_input_layer)
-        self.decoder_src = self.Decoder()
-        self.decoder_dst = self.Decoder()        
+        self.decoder = self.Decoder()
+        self.inter_B = self.Intermediate ()
+        self.inter_AB = self.Intermediate ()
         
         if not self.is_first_run():
-            self.encoder.load_weights     (self.get_strpath_storage_for_file(self.encoderH5))
-            self.decoder_src.load_weights (self.get_strpath_storage_for_file(self.decoder_srcH5))
-            self.decoder_dst.load_weights (self.get_strpath_storage_for_file(self.decoder_dstH5))
+            self.encoder.load_weights  (self.get_strpath_storage_for_file(self.encoderH5))
+            self.decoder.load_weights  (self.get_strpath_storage_for_file(self.decoderH5))
+            self.inter_B.load_weights  (self.get_strpath_storage_for_file(self.inter_BH5))
+            self.inter_AB.load_weights (self.get_strpath_storage_for_file(self.inter_ABH5))
 
-        self.autoencoder_src = self.keras.models.Model([ae_input_layer,mask_layer], self.decoder_src(self.encoder(ae_input_layer)))
-        self.autoencoder_dst = self.keras.models.Model([ae_input_layer,mask_layer], self.decoder_dst(self.encoder(ae_input_layer)))
-
+        code = self.encoder(ae_input_layer)
+        AB = self.inter_AB(code)
+        B = self.inter_B(code)
+        self.autoencoder_src = self.keras.models.Model([ae_input_layer,mask_layer], self.decoder(self.keras.layers.Concatenate()([AB, AB])) )
+        self.autoencoder_dst = self.keras.models.Model([ae_input_layer,mask_layer], self.decoder(self.keras.layers.Concatenate()([B, AB])) )
+            
         if self.is_training_mode:
             self.autoencoder_src, self.autoencoder_dst = self.to_multi_gpu_model_if_possible ( [self.autoencoder_src, self.autoencoder_dst] )
                 
@@ -57,20 +63,22 @@ class Model(ModelBase):
             from models import TrainingDataGenerator
             f = TrainingDataGenerator.SampleTypeFlags 
             self.set_training_data_generators ([            
-                    TrainingDataGenerator(self, TrainingDataType.FACE_SRC, batch_size=self.batch_size, output_sample_types=[ [f.WARPED_TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_M | f.MASK_FULL, 128] ], random_flip=True ),
-                    TrainingDataGenerator(self, TrainingDataType.FACE_DST, batch_size=self.batch_size, output_sample_types=[ [f.WARPED_TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_M | f.MASK_FULL, 128] ], random_flip=True )
+                    TrainingDataGenerator(self, TrainingDataType.FACE_SRC_YAW_SORTED_AS_DST,  batch_size=self.batch_size, output_sample_types=[ [f.WARPED_TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_M | f.MASK_FULL, 128] ], random_flip=True ),
+                    TrainingDataGenerator(self, TrainingDataType.FACE_DST,  batch_size=self.batch_size, output_sample_types=[ [f.WARPED_TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_BGR, 128], [f.TRANSFORMED | f.FULL_FACE | f.MODE_M | f.MASK_FULL, 128] ], random_flip=True )
                 ])
+            
     #override
     def onSave(self):        
         self.save_weights_safe( [[self.encoder, self.get_strpath_storage_for_file(self.encoderH5)],
-                                [self.decoder_src, self.get_strpath_storage_for_file(self.decoder_srcH5)],
-                                [self.decoder_dst, self.get_strpath_storage_for_file(self.decoder_dstH5)]] )
+                                [self.decoder, self.get_strpath_storage_for_file(self.decoderH5)],
+                                [self.inter_B, self.get_strpath_storage_for_file(self.inter_BH5)],
+                                [self.inter_AB, self.get_strpath_storage_for_file(self.inter_ABH5)]] )
         
     #override
     def onTrainOneEpoch(self, sample):
         warped_src, target_src, target_src_mask = sample[0]
         warped_dst, target_dst, target_dst_mask = sample[1]    
-  
+
         loss_src = self.autoencoder_src.train_on_batch( [warped_src, target_src_mask], [target_src, target_src_mask] )
         loss_dst = self.autoencoder_dst.train_on_batch( [warped_dst, target_dst_mask], [target_dst, target_dst_mask] )
         
@@ -133,33 +141,36 @@ class Model(ModelBase):
             
         return ConverterMasked(self.predictor_func, predictor_input_size=128, output_size=128, face_type=FaceType.FULL, clip_border_mask_per=0.046875, **in_options)
         
-    def Encoder(self, input_layer):
+    def Encoder(self, input_layer,):
         x = input_layer
         x = conv(self.keras, x, 128)
         x = conv(self.keras, x, 256)
         x = conv(self.keras, x, 512)
         x = conv(self.keras, x, 1024)
+        x = self.keras.layers.Flatten()(x)
+        return self.keras.models.Model(input_layer, x)
 
-        x = self.keras.layers.Dense(512)(self.keras.layers.Flatten()(x))
+    def Intermediate(self):
+        input_layer = self.keras.layers.Input(shape=(None, 8 * 8 * 1024))
+        x = input_layer
+        x = self.keras.layers.Dense(256)(x)
         x = self.keras.layers.Dense(8 * 8 * 512)(x)
         x = self.keras.layers.Reshape((8, 8, 512))(x)
         x = upscale(self.keras, x, 512)
-            
         return self.keras.models.Model(input_layer, x)
 
-    def Decoder(self):
-        input_ = self.keras.layers.Input(shape=(16, 16, 512))
+    def Decoder(self): 
+        input_ = self.keras.layers.Input(shape=(16, 16, 1024))
         x = input_
         x = upscale(self.keras, x, 512)
         x = upscale(self.keras, x, 256)
         x = upscale(self.keras, x, 128)
+        x = self.keras.layers.convolutional.Conv2D(3, kernel_size=5, padding='same', activation='sigmoid')(x)
         
         y = input_  #mask decoder
         y = upscale(self.keras, y, 512)
         y = upscale(self.keras, y, 256)
         y = upscale(self.keras, y, 128)
-            
-        x = self.keras.layers.convolutional.Conv2D(3, kernel_size=5, padding='same', activation='sigmoid')(x)
-        y = self.keras.layers.convolutional.Conv2D(1, kernel_size=5, padding='same', activation='sigmoid')(y)
+        y = self.keras.layers.convolutional.Conv2D(1, kernel_size=5, padding='same', activation='sigmoid' )(y)
         
         return self.keras.models.Model(input_, [x,y])
